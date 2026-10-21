@@ -40,25 +40,147 @@ else
     log -t "$TAG" "Gateway app not installed — nothing to sync"
 fi
 
+# ── Wait for PackageManager ───────────────────────────
+# service.sh runs in late_start, which is still early enough that `pm` is not
+# answering yet: every grant below silently did nothing on a cold boot, which
+# is how RECEIVE_SMS came to be ungranted while the log claimed otherwise.
+# Backgrounded so the wait does not hold up Magisk's service stage.
+wait_for_pm() {
+    i=0
+    while [ "$(getprop sys.boot_completed)" != "1" ] && [ $i -lt 150 ]; do
+        sleep 2
+        i=$((i + 1))
+    done
+    i=0
+    while ! pm path android >/dev/null 2>&1 && [ $i -lt 30 ]; do
+        sleep 2
+        i=$((i + 1))
+    done
+}
+
+# ── Keep the app's Magisk su policy on "allow" ────────
+# The gateway is useless without root: it drives the ALSA mixer through
+# tinymix to route agent audio into the GSM uplink, and grants itself
+# RECORD_AUDIO via appops.  Denied, it still answers calls and bridges them
+# with no audio in either direction, which is a much worse failure than not
+# answering at all.
+#
+# A superuser prompt that nobody is there to answer — this is a headless
+# gateway — writes policy=1 (deny) permanently, and that is exactly how a
+# working device went silent on 2026-09-09.  Seed policy=2 (allow) on every
+# boot so a stray prompt or a reinstall cannot leave it denied.
+#
+# Note this deliberately overrides a manual deny: on a dedicated gateway that
+# is the intent.  Remove this module to take the grant away.
+seed_su_policy() {
+    # The uid is assigned when the app is installed, so it cannot be baked in
+    # at flash time and can change across a reinstall.  Read it back instead.
+    # dumpsys prints it as userId= up to Android 14 and as appId= on 15.
+    SU_UID=$(stat -c %u "/data/user/0/$PKG" 2>/dev/null)
+    case "$SU_UID" in
+        ''|*[!0-9]*)
+            SU_UID=$(dumpsys package "$PKG" 2>/dev/null | grep -m1 -oE '(userId|appId)=[0-9]+' | cut -d= -f2)
+            ;;
+    esac
+    case "$SU_UID" in
+        ''|*[!0-9]*)
+            log -t "$TAG" "su policy: could not resolve uid for $PKG — not seeded"
+            return
+            ;;
+    esac
+
+    # REPLACE/upsert syntax varies with the schema Magisk ships, so branch on
+    # whether the row exists rather than relying on a constraint being there.
+    if magisk --sqlite "SELECT policy FROM policies WHERE uid=$SU_UID" 2>/dev/null | grep -q policy; then
+        magisk --sqlite "UPDATE policies SET policy=2, until=0 WHERE uid=$SU_UID" >/dev/null 2>&1
+    else
+        magisk --sqlite "INSERT INTO policies (uid,policy,until,logging,notification) VALUES ($SU_UID,2,0,1,1)" >/dev/null 2>&1
+    fi
+
+    if magisk --sqlite "SELECT policy FROM policies WHERE uid=$SU_UID" 2>/dev/null | grep -q "policy=2"; then
+        log -t "$TAG" "su policy: uid $SU_UID allowed"
+    else
+        log -t "$TAG" "su policy: FAILED to allow uid $SU_UID — gateway will bridge calls with no audio"
+    fi
+}
+
 # ── Grant runtime permissions automatically ───────────
 # These normally require user approval via UI prompts.
 # Granting them here avoids manual setup on a headless gateway.
 PKG="com.callagent.gateway"
+(
+wait_for_pm
+seed_su_policy
 for PERM in \
     android.permission.RECORD_AUDIO \
     android.permission.READ_PHONE_STATE \
     android.permission.READ_PHONE_NUMBERS \
     android.permission.READ_CALL_LOG \
-    android.permission.CALL_PHONE \
-    android.permission.ANSWER_PHONE_CALLS \
+    android.permission.RECEIVE_SMS \
+    android.permission.SEND_SMS \
     android.permission.ACCESS_FINE_LOCATION \
     android.permission.ACCESS_COARSE_LOCATION \
+    android.permission.CALL_PHONE \
+    android.permission.ANSWER_PHONE_CALLS \
     android.permission.POST_NOTIFICATIONS \
 ; do
     pm grant "$PKG" "$PERM" 2>/dev/null && \
         log -t "$TAG" "Granted: $PERM" || \
         log -t "$TAG" "Skip (already granted or N/A): $PERM"
 done
+
+# ── No outgoing SMS rate limit ────────────────────────
+# SmsUsageMonitor stops an app that is not the default SMS app after 30
+# messages in 30 minutes and asks the user to confirm — a dialog nobody is
+# there to answer on a gateway.  It reads these two globals before falling
+# back to the framework defaults, so setting them lifts the cap.
+settings put global sms_outgoing_check_interval_ms 1000 2>/dev/null && \
+    log -t "$TAG" "Outgoing SMS rate limit lifted" || \
+    log -t "$TAG" "Could not lift outgoing SMS rate limit"
+settings put global sms_outgoing_check_max_count 1000000 2>/dev/null
+
+# ── Keep SMS traffic silent ───────────────────────────
+# The gateway forwards messages; it does not need the device to announce them,
+# and nobody is looking at this screen.  The default SMS app stays what it is -
+# it stores the messages and its copy is a useful independent record - but it
+# is not allowed to notify.
+#
+# The package is asked for, not assumed.  This used to be hardcoded to Google
+# Messages, so on a LineageOS build - which ships the AOSP app,
+# com.android.messaging - `pm path` failed on the first line and the whole
+# function silently did nothing, while the log still said it had run.
+#
+# Both levers are pulled because which one works depends on the release:
+# POST_NOTIFICATIONS is the permission from Android 13 on, and the
+# POST_NOTIFICATION appop is what actually gates the shade before that.
+MSGS="com.google.android.apps.messaging"
+silence_messages() {
+    _silenced=1
+    _default=$(settings get secure sms_default_application 2>/dev/null | tr -d '\r')
+    case "$_default" in null|'') _default="" ;; esac
+    for _pkg in $_default com.google.android.apps.messaging com.android.messaging; do
+        [ -n "$_pkg" ] || continue
+        pm path "$_pkg" >/dev/null 2>&1 || continue
+        pm revoke "$_pkg" android.permission.POST_NOTIFICATIONS 2>/dev/null
+        appops set --uid "$_pkg" POST_NOTIFICATION ignore 2>/dev/null
+        appops set "$_pkg" POST_NOTIFICATION ignore 2>/dev/null
+        MSGS="$_pkg"
+        _silenced=0
+    done
+    return $_silenced
+}
+
+silence_messages && log -t "$TAG" "Silenced notifications: $MSGS"
+
+# Again once the SMS role has settled.  POST_NOTIFICATIONS is granted to the
+# default SMS app *by the role*, and the role is re-evaluated during a package
+# scan — a fresh module install, for one — which put the permission straight
+# back after the first pass revoked it.
+(
+    sleep 45
+    silence_messages && log -t "$TAG" "Silenced notifications (second pass): $MSGS"
+) &
+) &
 
 # ── PermissionController: hidden by Magisk overlay ────
 # The module's filesystem overlay hides PermissionController's APK
@@ -114,20 +236,22 @@ appops set "$PKG" RECORD_AUDIO allow 2>/dev/null && \
 # /system/bin/tinymix via Magisk overlay can hit SELinux "Permission denied"
 # on some devices, so we install to /data/local/tmp/ which has a permissive
 # context.  The app prefers /data/local/tmp/ in its discovery order.
-# The bundled binary is ARM64 only — skip on 32-bit devices (e.g. S4 Mini).
+# tinymix is bundled once per ABI: the ALSA control ioctls encode the size of
+# structs holding `long`, so an ARM64 build and an armeabi-v7a build speak
+# different ioctl ABIs and neither works on the other's kernel.
 DEVICE_ABI=$(getprop ro.product.cpu.abi 2>/dev/null)
-if [ -f "$MODDIR/tinymix" ]; then
-    case "$DEVICE_ABI" in
-        arm64*|aarch64*)
-            cp "$MODDIR/tinymix" /data/local/tmp/tinymix
-            chmod 755 /data/local/tmp/tinymix
-            chown root:root /data/local/tmp/tinymix
-            log -t "$TAG" "tinymix: installed ARM64 binary to /data/local/tmp/tinymix"
-            ;;
-        *)
-            log -t "$TAG" "tinymix: skipped (device ABI=$DEVICE_ABI, bundled binary is ARM64)"
-            ;;
-    esac
+case "$DEVICE_ABI" in
+    arm64*|aarch64*) TINYMIX_SRC="$MODDIR/tinymix" ;;
+    arm*)            TINYMIX_SRC="$MODDIR/tinymix32" ;;
+    *)               TINYMIX_SRC="" ;;
+esac
+if [ -n "$TINYMIX_SRC" ] && [ -f "$TINYMIX_SRC" ]; then
+    cp "$TINYMIX_SRC" /data/local/tmp/tinymix
+    chmod 755 /data/local/tmp/tinymix
+    chown root:root /data/local/tmp/tinymix
+    log -t "$TAG" "tinymix: installed $DEVICE_ABI binary to /data/local/tmp/tinymix"
+else
+    log -t "$TAG" "tinymix: no bundled build for ABI=$DEVICE_ABI"
 fi
 TINYMIX_FOUND=false
 for TPATH in /data/local/tmp/tinymix /vendor/bin/tinymix /system/bin/tinymix /system/xbin/tinymix; do
@@ -144,18 +268,22 @@ fi
 # ── Ensure tinycap is available ───────────────────────
 # tinycap is needed to probe ALSA capture PCMs for modem downlink audio.
 # Same deployment strategy as tinymix: /data/local/tmp/ for SELinux compat.
-if [ -f "$MODDIR/tinycap" ]; then
-    case "$DEVICE_ABI" in
-        arm64*|aarch64*)
-            cp "$MODDIR/tinycap" /data/local/tmp/tinycap
-            chmod 755 /data/local/tmp/tinycap
-            chown root:root /data/local/tmp/tinycap
-            log -t "$TAG" "tinycap: installed ARM64 binary to /data/local/tmp/tinycap"
-            ;;
-        *)
-            log -t "$TAG" "tinycap: skipped (device ABI=$DEVICE_ABI, bundled binary is ARM64)"
-            ;;
-    esac
+# The bundled tinycap is an ARM64 C build with no source in this tree, so on a
+# 32-bit device fall back to the ROM's own — LineageOS ships tinyplay/tinycap/
+# tinypcminfo on the msm8960 devices, and the app only ever looks for tinycap
+# at the /data/local/tmp path.
+TINYCAP_SRC=""
+case "$DEVICE_ABI" in
+    arm64*|aarch64*) [ -f "$MODDIR/tinycap" ] && TINYCAP_SRC="$MODDIR/tinycap" ;;
+    *)               [ -x /system/bin/tinycap ] && TINYCAP_SRC=/system/bin/tinycap ;;
+esac
+if [ -n "$TINYCAP_SRC" ]; then
+    cp "$TINYCAP_SRC" /data/local/tmp/tinycap
+    chmod 755 /data/local/tmp/tinycap
+    chown root:root /data/local/tmp/tinycap
+    log -t "$TAG" "tinycap: installed $TINYCAP_SRC to /data/local/tmp/tinycap"
+else
+    log -t "$TAG" "tinycap: none available for ABI=$DEVICE_ABI — PCM probe will be skipped"
 fi
 
 # ── Log ALSA card info for diagnostics ────────────────

@@ -2,6 +2,7 @@ package com.callagent.gateway
 
 import android.media.AudioAttributes
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 
 /**
@@ -32,8 +33,61 @@ data class DeviceProfile(
      *  after AudioTrack.play() when route is settled). */
     val mixerIncallMusicCmd: String,
 
-    /** Grep pattern for diagnostic tinymix dump. */
-    val mixerDiagGrep: String,
+    /** Keep the phone's own speaker and microphone out of the call.
+     *
+     *  For a digital bridge they are not part of the audio path at all, and
+     *  leaving them live is actively harmful: the microphone mixes the room
+     *  into the GSM uplink, and whatever the speaker plays comes back through
+     *  it, so the caller hears their own voice repeating.
+     *
+     *  Muting goes through AudioManager rather than the ALSA voice controls —
+     *  Voice Rx/Tx Device Mute are re-applied by the HAL when it programs the
+     *  voice-call mixer path and had no lasting effect. */
+    val silenceLocalAudio: Boolean = false,
+
+    /** Consecutive silent frames before a capture source is abandoned.
+     *
+     *  The default is deliberately impatient, which is right when the fallback
+     *  is a microphone that always works.  Where the digital source is the only
+     *  acceptable one, bailing out after half a second throws it away during
+     *  the ordinary gap before the far end starts talking.
+     *
+     *  25 frames was the old hard-coded value and is why in-call capture looked
+     *  impossible on SM6150 for a long time: the source was working, and was
+     *  being discarded during the pause before either party spoke.  The default
+     *  is now 100 (~2s), which is still prompt enough to fall back off a source
+     *  that is genuinely dead. */
+    val captureSilenceFrames: Int = 100,
+
+    /** Voice sessions to mark ACTIVE with the audio HAL, as hex VSIDs.
+     *
+     *  The Qualcomm HAL gates in-call recording — and the per-session voice
+     *  mutes — on voice_is_call_state_active().  On this device that flag is
+     *  never set: `voice_extn: update_call_states is_call_active:0, in_call:1,
+     *  mode:2` with `cur_state=1` (CALL_INACTIVE) for every VSID, even while
+     *  MODE_IN_CALL is set and the VoiceMMode2 ALSA session is running.  So the
+     *  HAL never starts the record session, every in-call capture source
+     *  returns silence, and Voice Tx Device Mute does nothing.
+     *
+     *  voice_extn accepts "vsid=<hex>;call_state=<n>" and implements an
+     *  INACTIVE -> ACTIVE transition, which is what this announces. */
+    val halCallActiveVsids: List<String> = emptyList(),
+
+    /** Shell command run immediately after AudioRecord.startRecording().
+     *
+     *  Opening a capture stream resets that front-end's mixer state, so in-call
+     *  capture routing set during bridge setup is already gone by the time the
+     *  stream exists.  Measured on SM6150: AudioSource.VOICE_CALL opens
+     *  MultiMedia9 (pcm27c), and that front-end's VOC_REC_DL/UL read Off once
+     *  capture is running even though the ones set on MultiMedia1/4/8 stay On. */
+    val mixerCaptureCmd: String = "",
+
+
+    /** Readback of the handful of controls this SoC's bridge depends on.
+     *  Logged before and after [mixerSetupCmd] so a failed setup is visible in
+     *  the call log.  The interesting controls are entirely SoC-specific, so
+     *  each profile owns its own command; empty = skip the readback. */
+    val mixerVerifyCmd: String,
 
     // ── Volume calibration ──
 
@@ -85,8 +139,123 @@ data class DeviceProfile(
 
     // ── Timing ──
 
+    /** Whether our own playback is audible to the capture source.
+     *
+     *  The double-talk/echo gate exists because on most devices the injected
+     *  agent audio leaks back into capture.  Once playback is routed straight
+     *  to Telephony Tx it never reaches the speaker, so the microphone cannot
+     *  hear it — and the gate then does nothing but discard the caller's voice
+     *  every time the agent talks. */
+    val playbackLeaksIntoCapture: Boolean = true,
+
+    /** Prefer UNPROCESSED/CAMCORDER over the voice-tuned capture sources.
+     *
+     *  When the caller is heard acoustically, the voice sources are the wrong
+     *  tool: their echo canceller and noise suppression are built to remove
+     *  exactly the loudspeaker signal we are trying to record, and their AGC
+     *  pumps the room.  UNPROCESSED bypasses that chain. */
+    val preferUnprocessedMic: Boolean = false,
+
+    /** Put VOICE_RECOGNITION at the head of the capture list.
+     *
+     *  For handsets where VOICE_CALL opens and reports a plausible level but
+     *  does not deliver frames at a steady 50/s.  That failure is invisible to
+     *  the silence detector -- there *is* audio, it simply arrives in bursts --
+     *  and the resulting gappy uplink reads to an AI agent's barge-in detector
+     *  as the caller interrupting, so it stops mid-sentence.  Measured on the
+     *  S4 Mini: VOICE_CALL@16k sent 1173 packets where 1676 arrived, while
+     *  VOICE_RECOGNITION on the same call sent 1650 of 1675.
+     *
+     *  The rest of the list is kept as fallback rather than pinning this one
+     *  source: if it ever fails to open, a call with no audio at all is worse
+     *  than a call on a second-choice source. */
+    val preferVoiceRecognition: Boolean = false,
+
+    /** Ask AudioRecord to capture from the telephony RX device.
+     *
+     *  The mirror of [playbackToTelephonyTx].  Without it, capture on a device
+     *  whose HAL refuses AudioSource.VOICE_CALL falls back to the microphone,
+     *  which records the room rather than the call — the far end is only heard
+     *  at all if the downlink happens to be audible on the speaker, and once
+     *  the downlink is muted there the agent hears nothing but background. */
+    val captureFromTelephonyRx: Boolean = false,
+
+    /** Ask for the playback track to be routed to the telephony TX device.
+     *
+     *  Setting incall_music_enabled is not by itself enough to make
+     *  AudioPolicyManager choose the incall_music_uplink output: the track is
+     *  still attached to the speaker backend.  Naming the telephony device as
+     *  the track's preferred device asks the policy manager for that route
+     *  explicitly, which is something only a privileged app can get away with. */
+    val playbackToTelephonyTx: Boolean = false,
+
+    /** Turn incall_music on before the AudioTrack is created, not after.
+     *
+     *  This HAL decides the output usecase when the track is *created*:
+     *  AudioPolicyManager only offers the incall_music_uplink mixPort — the one
+     *  routed to Telephony Tx — while incall_music_enabled is already true, so
+     *  setting the parameter after play() leaves the track bound to the speaker
+     *  for its whole life.  MSM8930 wants the opposite order (its HAL starts
+     *  the incall-music usecase only once a STREAM_MUSIC output exists), which
+     *  is why this is per-profile rather than simply reordered. */
+    val incallMusicBeforeTrack: Boolean = false,
+
+    /** Open the playback track as stereo rather than mono.
+     *
+     *  Purely a routing key, not a quality choice: the HAL's
+     *  "incall_music_uplink" mixPort — the one the audio policy routes to
+     *  "Telephony Tx" — declares AUDIO_CHANNEL_OUT_STEREO and nothing else, so
+     *  AudioPolicyManager cannot match a mono track to it and quietly hands the
+     *  track to the speaker path instead.  Mono samples are duplicated into
+     *  both channels on the way out. */
+    val playbackStereo: Boolean = false,
+
+    /** Request PERFORMANCE_MODE_LOW_LATENCY for the playback track.
+     *
+     *  Worth roughly 60ms: AudioTrack's ordinary minimum for 16 kHz stereo is
+     *  about 80ms, and the low-latency path is a fraction of that.
+     *
+     *  Historically this was the thing NOT to do — low-latency made the HAL
+     *  serve the track from low-latency-playback on MultiMedia5, a front-end
+     *  wired to the speaker rather than to the modem, so the caller heard
+     *  nothing from the agent.  That is why the code carries a warning against
+     *  it.  Since routing is now requested explicitly through
+     *  setPreferredDevice(TYPE_TELEPHONY) rather than inferred from the buffer
+     *  size, the usecase may no longer follow the performance mode — but that
+     *  has to be confirmed on the device, by checking that playback still
+     *  reports routedTo=18 and the caller still hears the agent. */
+    val playbackLowLatency: Boolean = false,
+
+    /** Playback buffer size in milliseconds, or 0 for AudioTrack's minimum.
+     *
+     *  This decides which HAL output the track lands on, and therefore whether
+     *  incall_music can reach the modem uplink at all.  A minimum-sized buffer
+     *  qualifies for AudioFlinger's fast path, which the Qualcomm HAL serves
+     *  with low-latency-playback on MultiMedia5; a larger request falls back to
+     *  deep-buffer-playback on MultiMedia1.  On SM6150 the fast path left the
+     *  agent audible on the phone's own speaker while the caller heard nothing
+     *  from it. */
+    val playbackBufferMs: Int = 0,
+
     /** Delay (ms) after speaker route change before mixer setup. */
     val routeChangeDelayMs: Long,
+
+    /** Delay (ms) before opening AudioRecord/AudioTrack after call activation.
+     *
+     * Some Qualcomm builds destroy and recreate an AudioTrack while the
+     * Telecom speaker route is still settling.  If that happens to the track
+     * used for incall_music, Android may silently recreate it as an ordinary
+     * output even though routedDevice later reports TELEPHONY. */
+    val audioRouteSettleDelayMs: Long = 0,
+
+    /** Delay (ms) after RTP release before reusing the Qualcomm voice output.
+     *
+     * Pixel 4a's deep-buffer incall_music output can remain blocked in
+     * AudioFlinger for several seconds after the Java AudioTrack is released.
+     * A following call must wait for that output to drain or it may inherit a
+     * stale TELEPHONY_TX stream.
+     */
+    val audioStopSettleDelayMs: Long = 0,
 
     /** Delay (ms) for appops propagation on cold boot. */
     val appopsPropagationMs: Long,
@@ -105,7 +274,43 @@ data class DeviceProfile(
          *
          * Falls back to `which tinymix` in the root shell PATH.
          */
-        val tinymixBin: String by lazy { discoverTinymix() }
+        @Volatile private var cachedTinymix: String = ""
+        @Volatile private var lastProbeMs: Long = 0L
+        @Volatile private var missingReported = false
+
+        /** Minimum gap between discovery attempts once one has come back empty. */
+        private const val TINYMIX_REPROBE_MS = 5_000L
+
+        /**
+         * Resolved path to the tinymix binary, re-probed until one is found.
+         *
+         * Only a *successful* discovery is cached.  Discovery runs through the
+         * root shell, so a shell that was denied — or had just died and not yet
+         * been replaced — makes a perfectly good binary look absent.  This was
+         * a `by lazy`, which cached that empty answer for the life of the
+         * process: a single transient root failure disabled every mixer control
+         * until the app was force-stopped, and the gateway went on answering
+         * calls it could no longer bridge, silently.
+         *
+         * Re-probing is rate-limited to [TINYMIX_REPROBE_MS] so a genuinely
+         * rootless device does not run four tinymix invocations per frame.
+         */
+        val tinymixBin: String
+            get() {
+                cachedTinymix.let { if (it.isNotEmpty()) return it }
+                synchronized(this) {
+                    cachedTinymix.let { if (it.isNotEmpty()) return it }
+                    val now = SystemClock.elapsedRealtime()
+                    if (lastProbeMs != 0L && now - lastProbeMs < TINYMIX_REPROBE_MS) return ""
+                    lastProbeMs = now
+                    val found = discoverTinymix()
+                    if (found.isNotEmpty()) {
+                        cachedTinymix = found
+                        missingReported = false
+                    }
+                    return found
+                }
+            }
 
         private fun discoverTinymix(): String {
             val paths = listOf(
@@ -115,9 +320,15 @@ data class DeviceProfile(
                 "/system/xbin/tinymix",
             )
             try {
-                // Batch-check all paths in a single su call for speed
+                // Batch-check all paths in a single su call for speed.
+                // The executable bit alone is not enough: a Magisk overlay can
+                // put a binary of the wrong ABI on the path (an ARM64 tinymix
+                // over a 32-bit ROM's own), and the shell then refuses every
+                // invocation with "not executable: 64-bit ELF file" while the
+                // file still looks perfectly runnable.  Run it once and keep
+                // only a path that actually came back.
                 val checks = paths.joinToString("; ") { p ->
-                    "[ -x '$p' ] && echo 'FOUND:$p'"
+                    "[ -x '$p' ] && '$p' >/dev/null 2>&1 && echo 'FOUND:$p'"
                 }
                 val result = RootShell.execForOutput(
                     "$checks; which tinymix 2>/dev/null | head -1",
@@ -141,45 +352,39 @@ data class DeviceProfile(
                 Log.w(TAG, "tinymix discovery error: ${e.message}")
             }
 
-            Log.e(TAG, "tinymix NOT FOUND on device! ABOX/ALSA mixer controls will not work. " +
-                "Push a static arm64 tinymix binary to /data/local/tmp/tinymix (chmod 755)")
+            // Report the transition, not every probe: discovery now retries
+            // for as long as it keeps failing, and logging on each attempt
+            // would bury the call it is breaking.
+            if (!missingReported) {
+                missingReported = true
+                Log.e(TAG, "no runnable tinymix on device! ABOX/ALSA mixer controls will not work. " +
+                    "root=${RootShell.rootState()}. " +
+                    "Push a static tinymix for ${Build.SUPPORTED_ABIS.firstOrNull()} to " +
+                    "/data/local/tmp/tinymix (chmod 755)")
+            }
             return ""
         }
 
         /**
-         * Dump available ALSA mixer controls for diagnostics.
-         * Called once on first audio bridge setup.  Returns the dump for logging.
+         * Dump mixer state for diagnostics, once on the first audio bridge
+         * setup.  The device-specific half comes from the profile's
+         * [mixerVerifyCmd]; everything here is SoC-agnostic.
          */
-        fun discoverMixerControls(): String {
+        fun discoverMixerControls(profile: DeviceProfile): String {
             return try {
-                val sb = StringBuilder()
                 val bin = tinymixBin
-                if (bin.isNotEmpty()) {
-                    // Compact discovery: NSRC/bridge state + ALSA cards only.
-                    // Full routing map established in v2.8.42 — no need for
-                    // bulk control dumps, enum lists, or mixer_paths.xml parsing.
-                    val result = RootShell.execForOutput(
-                        "echo '=== ALSA cards ==='; cat /proc/asound/cards 2>/dev/null; " +
-                        "echo '=== NSRC/Bridge state ==='; " +
-                        "for i in 0 1 2 3 4; do " +
-                        "  echo -n \"NSRC\${i}=\"; $bin \"ABOX NSRC\${i}\" 2>/dev/null || echo 'N/A'; " +
-                        "  echo -n \"NSRC\${i}_Bridge=\"; $bin \"ABOX NSRC\${i} Bridge\" 2>/dev/null || echo 'N/A'; " +
-                        "done; " +
-                        "echo -n 'SoundType='; $bin 'ABOX Sound Type' 2>/dev/null || echo 'N/A'; " +
-                        "echo '=== total controls ==='; $bin 2>&1 | wc -l",
-                        timeoutMs = 8000
+                if (bin.isEmpty()) {
+                    return "=== tinymix not available ===\n" + RootShell.execForOutput(
+                        "cat /proc/asound/cards 2>/dev/null", timeoutMs = 3000
                     )
-                    sb.appendLine(result)
-                } else {
-                    sb.appendLine("=== tinymix not available ===")
-                    val info = RootShell.execForOutput(
-                        "cat /proc/asound/card0/id 2>/dev/null; " +
-                        "cat /proc/asound/card1/id 2>/dev/null",
-                        timeoutMs = 3000
-                    )
-                    sb.appendLine(info)
                 }
-                sb.toString()
+                val verify = resolveCmd(profile.mixerVerifyCmd)
+                RootShell.execForOutput(
+                    "echo '=== ALSA cards ==='; cat /proc/asound/cards 2>/dev/null; " +
+                        (if (verify.isNotEmpty()) "echo '=== ${profile.name} ==='; $verify; " else "") +
+                        "echo '=== total controls ==='; $bin 2>&1 | wc -l",
+                    timeoutMs = 8000
+                )
             } catch (e: Exception) {
                 "Mixer discovery failed: ${e.message}"
             }
@@ -201,6 +406,7 @@ data class DeviceProfile(
             val hw = Build.HARDWARE.lowercase()
             val board = Build.BOARD.lowercase()
             val model = Build.MODEL.lowercase()
+            val device = Build.DEVICE.lowercase()
             Log.i(TAG, "Detecting device: hw=$hw board=$board model=${Build.MODEL} device=${Build.DEVICE}")
 
             return when {
@@ -211,6 +417,18 @@ data class DeviceProfile(
                 // Samsung Galaxy S10e Exynos (Exynos 9820)
                 board.contains("exynos9820") || hw.contains("exynos") && model.contains("sm-g970") ->
                     exynos9820()
+
+                // Snapdragon 7-series (SM6150/SM7150) with WCD9375 codec —
+                // e.g. Poco X3 NFC.  Same incall_music path as MSM8930 but a
+                // different codec, so the WCD9304 control names do not apply.
+                // Pixel 4a (sunfish) reports the platform as sm6150 through
+                // ro.board.platform, but Build.BOARD/Build.HARDWARE are both
+                // "sunfish".  Match its codename (not the model name, which
+                // could also match the differently-routed Pixel 4a 5G) so it
+                // does not fall through to Generic and leave the mic live.
+                board.contains("sm6150") || board.contains("sm7150") ||
+                    device == "sunfish" || board == "sunfish" || hw == "sunfish" ->
+                    sm6150()
 
                 // Generic Qualcomm — try incall_music, skip WCD9304-specific controls
                 hw.contains("qcom") || hw.contains("qualcomm") ->
@@ -232,6 +450,7 @@ data class DeviceProfile(
         /** Samsung Galaxy S4 Mini (MSM8930 / WCD9304 codec) */
         fun msm8930() = DeviceProfile(
             name = "MSM8930 (S4 Mini)",
+            preferVoiceRecognition = true,
             mixerSetupCmd = buildString {
                 // Voice Rx mute (silence speaker)
                 append("tinymix 'Voice Rx Device Mute' 1 2>/dev/null; ")
@@ -311,13 +530,68 @@ data class DeviceProfile(
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null")
             },
-            mixerDiagGrep = "tinymix 2>&1 | grep -iE '(Voice Rx|Voice Tx|Incall_Music|EC_REF|DEC[1-4] Vol|DEC[1-4] MUX|ADC[1-3] Vol|MICBIAS|RX[0-9].*[Vv]ol|SPK DRV|LINEOUT[12] Vol|SLIM TX[0-9])'",
+            mixerVerifyCmd = buildString {
+                append("echo -n 'VoiceRxDevMute='; tinymix 'Voice Rx Device Mute' 2>&1; ")
+                append("echo -n 'VoiceTxMute='; tinymix 'Voice Tx Mute' 2>&1; ")
+                append("echo -n 'IncallMM1='; tinymix 'Incall_Music Audio Mixer MultiMedia1' 2>&1; ")
+                append("echo -n 'IncallMM2='; tinymix 'Incall_Music Audio Mixer MultiMedia2' 2>&1")
+            },
+            // UNVERIFIED — the S4 Mini was not available to test against.
+            // voice_extn is generic Qualcomm code, so the in-call recording
+            // gate (voice_is_call_state_active) is very likely the same one
+            // that kept SM6150 on acoustic capture.  This profile captures the
+            // caller through the microphone today for what may be exactly that
+            // reason.  The HAL rejects VSIDs it does not know, so listing the
+            // full set is harmless; VOICE_SESSION (10c01000) is the one an
+            // MSM8930-era HAL would actually use.
+            halCallActiveVsids = listOf("10c01000", "10dc1000", "11c05000"),
+            // Calibrated, not arbitrary: above roughly this the injected
+            // stream clips.  Raising it to index 5/15 was tried on a live call
+            // and made no audible difference at the far end — the incall_music
+            // path does not take its level from the STREAM_MUSIC index — so
+            // loudness has to come from playbackGain or the agent itself.
             musicVolPercent = 14,
-            captureGain = 2,
+            // Capture is relayed unaltered — the modem's level is already
+            // healthy and sm6150 does the same.  Playback keeps a x2: the far
+            // end reported the agent as quiet without it, and the STREAM_MUSIC
+            // index turned out not to drive the incall_music level at all, so
+            // this is the only lever left short of raising the agent itself.
+            captureGain = 1,
             playbackGain = 2,
-            noiseGateThreshold = 500,
+            // Measured on live calls: the modem's silence floor sits at
+            // rawCapRMS 6-174, while speech runs 471-4132.  At 500 the gate was
+            // biting into speech — a frame at 471 was zeroed outright — and the
+            // hard on/off at the threshold was audible as chatter at the starts
+            // and ends of words.  100 keeps the gate almost entirely out of the
+            // way, at the cost of relaying some of the modem's own hiss.
+            noiseGateThreshold = 100,
             echoGateThreshold = 300,
             doubleTalkRatio = 1.5f,
+            // Nothing to cancel: capture is AudioSource.VOICE_CALL straight off
+            // the modem and playback is injected digitally through
+            // incall_music, so the handset's speaker and microphone are not in
+            // the path and playback cannot reach the capture side.  Left on
+            // (the default) the echo gate and double-talk logic ran on every
+            // frame and did nothing but discard the caller whenever the agent
+            // spoke — the counters bore this out, gates:echo climbing steadily
+            // through a call where no acoustic echo was possible.
+            playbackLeaksIntoCapture = false,
+            // AudioSource.VOICE_CALL is uplink AND downlink mixed, and the
+            // uplink is where incall_music injects the agent — so the agent's
+            // own voice came straight back to it as if the caller had spoken,
+            // and its barge-in detector cut every phrase in half while the
+            // caller was silent.  Confirmed from the server's recordings.
+            //
+            // Downlink alone is the caller.  These are the two front-end
+            // switches the HAL's incall-rec paths use, and they have to be set
+            // after startRecording(): opening the capture stream reprograms
+            // that front-end, discarding anything written earlier.
+            mixerCaptureCmd = buildString {
+                append("tinymix 'MultiMedia1 Mixer VOC_REC_DL' 1 2>/dev/null; ")
+                append("tinymix 'MultiMedia1 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("echo -n 'VOC_REC_DL='; tinymix 'MultiMedia1 Mixer VOC_REC_DL' 2>&1; ")
+                append("echo -n 'VOC_REC_UL='; tinymix 'MultiMedia1 Mixer VOC_REC_UL' 2>&1")
+            },
             requireSpeakerMode = true,
             incallMusicParam = "incall_music_enabled",
             voiceDownlinkWorks = false,
@@ -404,11 +678,28 @@ data class DeviceProfile(
                 append("echo -n 'NSRC0_Bridge='; tinymix 'ABOX NSRC0 Bridge' 2>/dev/null; ")
                 append("echo -n 'NSRC1_Bridge='; tinymix 'ABOX NSRC1 Bridge' 2>/dev/null")
             },
-            // Diagnostic: NSRC/bridge state only (routing map fully understood).
-            mixerDiagGrep = buildString {
-                append("echo '=== NSRC/Bridge ==='; ")
-                append("tinymix 2>&1 | grep -iE '(nsrc|bridge)' | head -20")
+            // NSRC/bridge state — the controls the TX injection depends on.
+            // These names exist only on Samsung's ABOX DSP; on any other SoC
+            // tinymix answers "control not found", which is why this readback
+            // belongs to the profile rather than the shared call path.
+            mixerVerifyCmd = buildString {
+                append("echo -n 'NSRC0='; tinymix 'ABOX NSRC0' 2>&1; ")
+                append("echo -n 'NSRC1='; tinymix 'ABOX NSRC1' 2>&1; ")
+                append("echo -n 'NSRC0B='; tinymix 'ABOX NSRC0 Bridge' 2>&1; ")
+                append("echo -n 'NSRC1B='; tinymix 'ABOX NSRC1 Bridge' 2>&1; ")
+                append("echo -n 'NSRC2B='; tinymix 'ABOX NSRC2 Bridge' 2>&1; ")
+                append("echo -n 'SPUS0='; tinymix 'ABOX SPUS OUT0' 2>&1")
             },
+            // Deliberately NOT set: there is nothing on this device to route
+            // to.  Checked on the hardware — /vendor/etc/audio_policy_configuration.xml
+            // declares three mixPorts (deep, fast, primary) and contains no
+            // telephony device at all, and audio.primary.universal9820.so has
+            // no TELEPHONY_TX, no incall_rec usecases and no voice_extn
+            // call_state/vsid handling.  Against SM6150, where
+            // incall_music_uplink -> Telephony Tx is what carries injected
+            // audio into the modem, this device simply has no equivalent.
+            // Neither direction can be done digitally here; that is why the
+            // gateway moved to a Qualcomm device.
             musicVolPercent = 40,  // v2.8.45@30%+2x=audible but quiet. Raise for clarity.
             captureGain = 10,      // VOICE_RECOGNITION captures very quietly (rawCapRMS~2)
             playbackGain = 2,      // 40%+2x = moderate, SIFS0 only = no feedback
@@ -435,6 +726,250 @@ data class DeviceProfile(
             appopsPropagationMs = 300,
         )
 
+        /** Qualcomm SM6150/SM7150 (Snapdragon 730/732G) with WCD9375 codec.
+         *
+         *  ALSA card: sm6150-wcd9375-snd-card (3436 controls).
+         *
+         *  Present and used here:
+         *    Incall_Music Audio Mixer MultiMedia1/2/5/9  — digital injection
+         *      of STREAM_MUSIC into the modem uplink, the same mechanism the
+         *      S4 Mini uses and the one the Exynos S10e turned out to lack.
+         *    MultiMedia{1,4,8,9} Mixer VOC_REC_DL/UL     — in-call capture.
+         *      The HAL is supposed to set these when an app opens
+         *      AudioSource.VOICE_CALL; enabling them explicitly costs nothing
+         *      and covers the case where it does not.
+         *    Voice Rx Device Mute / Voice Tx Mute / Voice Tx Device Mute
+         *
+         *  Absent (WCD9304-only, so nothing from the MSM8930 profile that
+         *  touches them applies): MICBIAS* CAPLESS Switch, RX3 Digital Volume,
+         *  SPK DRV Volume, LINEOUT* Volume, Voice Rx Mute, Voip Rx Device Mute.
+         *
+         *  Note the Voice* controls are write-only on this firmware — reading
+         *  them returns "operation not permitted", which is expected and not a
+         *  failure.
+         *
+         *  Levels: capture on this device comes in very quiet (rawCapRMS in the
+         *  20-30 range), so the generic profile's 350 noise gate discarded
+         *  every frame and the far end heard pure silence.
+         */
+        fun sm6150() = DeviceProfile(
+            name = "SM6150/SM7150 (WCD9375)",
+            mixerSetupCmd = buildString {
+                // The downlink has to stay audible on the speaker: capture on
+                // this device is acoustic (the HAL gives no in-call recording
+                // and no telephony-RX capture), so the microphone hearing the
+                // speaker is the only way the agent hears the caller at all.
+                // Muting it is why the agent ended up hearing just the room.
+                append("tinymix 'Voice Rx Device Mute' 0 4294967295 20 2>/dev/null; ")
+                // Keep the uplink stream itself open — incall_music injects
+                // into it — but mute the *device* (microphone) leg of it.
+                // Without this the physical mic is mixed into the modem
+                // uplink, so the caller hears the room and their own voice
+                // coming back off the phone's speaker.  The two controls are
+                // separate on purpose: 'Voice Tx Mute' would silence the whole
+                // TX path including the injected agent audio, whereas
+                // 'Voice Tx Device Mute' drops only the mic contribution.
+                // AudioRecord keeps working — it reads the mic directly rather
+                // than through the voice TX path.
+                // These voice controls are 3-element arrays — the QCOM HAL
+                // writes them as {mute, session_vsid, ramp_ms} with
+                // ALL_SESSION_VSID = 0xFFFFFFFF.  "tinymix 'X' 1" only sets
+                // element 0, leaving mute untouched, which is why the earlier
+                // single-value writes silently did nothing.
+                append("tinymix 'Voice Tx Mute' 0 4294967295 20 2>/dev/null; ")
+                append("tinymix 'Voice Tx Device Mute' 1 4294967295 20 2>/dev/null; ")
+                // Digital injection: agent audio -> modem uplink.
+                // MultiMedia5 is the one that matters here: with a voice call
+                // up, the AudioTrack lands on MultiMedia5 (visible as
+                // "TERT_MI2S_RX Audio Mixer MultiMedia5: On"), not MultiMedia1/2
+                // the way it does on MSM8930.  Opening only MM1/MM2 left the
+                // agent's audio going to the speaker instead of the uplink, so
+                // the caller heard nothing from the agent — only their own
+                // voice echoing back off the mic.  All four available ports are
+                // opened so this survives the HAL choosing another front-end.
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia5' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null; ")
+                // In-call record direction.  The driver accepts 0-2 only
+                // (3/"both" is rejected as invalid argument), and it sits at 1
+                // — uplink — by default.  Uplink is our own side of the call,
+                // i.e. the audio incall_music injects, so capturing it fed the
+                // agent its own echo and read rawCapRMS≈5.  Downlink is the
+                // caller's voice, which is what the agent needs to hear.
+                append("tinymix 'Voc Rec Config' 2 2>/dev/null; ")
+                // In-call capture: DOWNLINK ONLY.
+                // The uplink leg must stay off.  It carries what we inject via
+                // incall_music, so routing it into the capture front-end feeds
+                // the agent its own voice — an echo entirely inside this phone,
+                // which is why it persisted even with the far end's microphone
+                // muted.  VOC_REC_UL was enabled here while the uplink was
+                // still silent and the mistake was invisible.
+                append("tinymix 'MultiMedia1 Mixer VOC_REC_DL' 1 2>/dev/null; ")
+                append("tinymix 'MultiMedia1 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia4 Mixer VOC_REC_DL' 1 2>/dev/null; ")
+                append("tinymix 'MultiMedia4 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia8 Mixer VOC_REC_DL' 1 2>/dev/null; ")
+                append("tinymix 'MultiMedia8 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia9 Mixer VOC_REC_DL' 1 2>/dev/null; ")
+                append("tinymix 'MultiMedia9 Mixer VOC_REC_UL' 0 2>/dev/null")
+            },
+            mixerRestoreCmd = buildString {
+                append("tinymix 'Voice Rx Device Mute' 0 4294967295 20 2>/dev/null; ")
+                append("tinymix 'Voice Tx Device Mute' 0 4294967295 20 2>/dev/null; ")
+                append("tinymix 'Voice Tx Mute' 0 4294967295 20 2>/dev/null; ")
+                append("tinymix 'Voc Rec Config' 1 2>/dev/null; ")
+                append("tinymix 'DEC1 MUX' 'ADC1' 2>/dev/null; ")
+                append("tinymix 'DEC2 MUX' 'ADC2' 2>/dev/null; ")
+                append("tinymix 'DEC3 MUX' 'ADC3' 2>/dev/null; ")
+                append("tinymix 'ADC1 Volume' 100 2>/dev/null; ")
+                append("tinymix 'ADC2 Volume' 100 2>/dev/null; ")
+                append("tinymix 'ADC3 Volume' 100 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 0 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 0 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia5' 0 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia1 Mixer VOC_REC_DL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia1 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia4 Mixer VOC_REC_DL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia4 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia8 Mixer VOC_REC_DL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia8 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia9 Mixer VOC_REC_DL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia9 Mixer VOC_REC_UL' 0 2>/dev/null")
+            },
+            mixerIncallMusicCmd = buildString {
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia1' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia5' 1 2>/dev/null; ")
+                append("tinymix 'Incall_Music Audio Mixer MultiMedia9' 1 2>/dev/null; ")
+                append("tinymix 'Voice Tx Mute' 0 4294967295 20 2>/dev/null; ")
+                // Re-assert the mic mute here as well as in mixerSetupCmd.  The
+                // write is accepted either way (rc=0), but the HAL rewrites the
+                // voice mutes while it brings the call up, so the one issued
+                // during mixer setup is overwritten before the call is
+                // established and the caller keeps hearing the room.  This
+                // command runs once playback is going, i.e. after the HAL has
+                // settled.
+                append("tinymix 'Voice Tx Device Mute' 1 4294967295 20 2>/dev/null")
+            },
+            // VoiceMMode1 and VoiceMMode2 — VoiceMMode2 is the session
+            // actually running here (pcm19c / TERT_MI2S_RX_Voice Mixer).
+            halCallActiveVsids = listOf("11c05000", "11dc5000"),
+            // ~6s: long enough to survive the silence before the agent speaks,
+            // since the digital source is the only one that counts here.
+            captureSilenceFrames = 300,
+            silenceLocalAudio = true,
+            // Re-assert in-call capture routing once the stream is open.
+            // MultiMedia9 is the front-end VOICE_CALL lands on here, so it is
+            // the one that actually has to carry VOC_REC.
+            mixerCaptureCmd = buildString {
+                // DIAGNOSTIC: silence everything local, so the only audio that
+                // can reach the far end is the digital in-call path.  These
+                // mutes are issued here rather than in mixerSetupCmd because
+                // the voice mutes are gated on the HAL's is_call_active flag,
+                // which RtpSession only sets on the way into initAudio — a
+                // mute written before that is discarded, which is why every
+                // earlier attempt at muting the mic did nothing.
+                //   Voice Rx Device Mute -> downlink no longer reaches the
+                //     speaker, so nothing is audible on the phone.
+                //   Voice Tx Device Mute -> microphone leaves the GSM uplink,
+                //     so the caller stops hearing the room and their own echo.
+                //   DEC MUX / ADC volumes -> the microphone is dead at the
+                //     codec, so AudioRecord cannot pick the room up either.
+                // If the agent can still hear the caller with all of this on,
+                // in-call digital capture is genuinely working.
+                append("tinymix 'Voice Rx Device Mute' 1 4294967295 20 2>/dev/null; ")
+                append("tinymix 'Voice Tx Device Mute' 1 4294967295 20 2>/dev/null; ")
+                append("tinymix 'DEC1 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'DEC2 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'DEC3 MUX' 'ZERO' 2>/dev/null; ")
+                append("tinymix 'ADC1 Volume' 0 2>/dev/null; ")
+                append("tinymix 'ADC2 Volume' 0 2>/dev/null; ")
+                append("tinymix 'ADC3 Volume' 0 2>/dev/null; ")
+                // No VOC_REC / Voc Rec Config writes here any more.  Those
+                // were added while the HAL considered the call inactive and was
+                // doing nothing; now that is_call_active is set the HAL selects
+                // SND_DEVICE_IN_INCALL_REC_* and programs these itself, and
+                // overwriting them underneath it is more likely to break the
+                // record session than to help.  Report what the HAL chose.
+                // Kill the uplink leg again once the stream exists — opening
+                // the capture front-end reprograms its mixers.
+                append("tinymix 'MultiMedia9 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("tinymix 'MultiMedia1 Mixer VOC_REC_UL' 0 2>/dev/null; ")
+                append("echo -n 'MM9_DL='; tinymix 'MultiMedia9 Mixer VOC_REC_DL' 2>&1; ")
+                append("echo -n 'MM9_UL='; tinymix 'MultiMedia9 Mixer VOC_REC_UL' 2>&1; ")
+                append("echo -n 'VocRecCfg='; tinymix 'Voc Rec Config' 2>&1")
+            },
+            mixerVerifyCmd = buildString {
+                append("echo -n 'IncallMM1='; tinymix 'Incall_Music Audio Mixer MultiMedia1' 2>&1; ")
+                append("echo -n 'IncallMM2='; tinymix 'Incall_Music Audio Mixer MultiMedia2' 2>&1; ")
+                append("echo -n 'IncallMM5='; tinymix 'Incall_Music Audio Mixer MultiMedia5' 2>&1; ")
+                append("echo -n 'VocRecDL='; tinymix 'MultiMedia1 Mixer VOC_REC_DL' 2>&1; ")
+                append("echo -n 'VocRecUL='; tinymix 'MultiMedia1 Mixer VOC_REC_UL' 2>&1; ")
+                append("echo -n 'VocRecCfg='; tinymix 'Voc Rec Config' 2>&1")
+            },
+            musicVolPercent = 20,
+            // Digital in-call capture arrives at full scale — measured
+            // rawCapRMS 1000-5200 against 26-190 on the acoustic path — so it
+            // needs no gain at all.  At 4x it clipped (capRMS ~20000 of 32767).
+            captureGain = 1,
+            playbackGain = 2,
+            // 40-55 was measured against a loud recorded announcement; a real
+            // caller coming through the speaker only reaches rawCapRMS 19-26,
+            // and a gate of 30 discarded nearly all of it (noise=561 vs
+            // fwd=481, capRMS=0) so the agent heard nothing at all.  Sits just
+            // under the speech floor instead; voiceCallVolPercent below is what
+            // buys back the headroom over room noise.
+            noiseGateThreshold = 12,
+            echoGateThreshold = 300,
+            doubleTalkRatio = 1.5f,
+            requireSpeakerMode = true,
+            incallMusicParam = "incall_music_enabled",
+            // Capture is acoustic, so the caller's voice has to be loud on the
+            // speaker for the microphone to pick it out of the room.  Nothing
+            // of ours plays locally any more — the agent's audio goes straight
+            // to Telephony Tx — so there is no feedback cost to turning this up.
+            voiceCallVolPercent = 100,
+            // It reads silent only while the HAL believes the call is
+            // inactive.  With call_state announced first the in-call record
+            // session runs, and downlink-only is what we want: VOICE_CALL also
+            // captures the uplink, which carries the agent's injected audio.
+            voiceDownlinkWorks = true,
+            // The echo this gate existed for was VOC_REC_UL folding our own
+            // uplink into the capture, and that is fixed at the routing level
+            // now.  Left on, it only destroys real audio: measured echo=601 and
+            // noise=585 gated against fwd=166 forwarded, i.e. it was dropping
+            // most of the caller, and its echoGainRatio estimate sits at 0.00
+            // because it can only learn from frames it has already classified
+            // as echo — a deadlock it cannot leave on its own.
+            playbackLeaksIntoCapture = false,
+            preferUnprocessedMic = true,
+            // Measured: TYPE_TELEPHONY is offered as an input and
+            // setPreferredDevice is accepted (routedFrom=18), but every source
+            // then reads rawCapRMS=0 — this HAL provides no downlink capture,
+            // and forcing the route takes the working mic fallback with it.
+            captureFromTelephonyRx = false,
+            playbackToTelephonyTx = true,
+            // The HAL binds the usecase at track creation, so the parameter
+            // has to be set first.
+            incallMusicBeforeTrack = true,
+            // The incall_music_uplink mixPort accepts stereo only.
+            playbackStereo = true,
+            // The low-latency output is unstable on this firmware when
+            // Telecom changes the voice route: AudioTrack reports a dead
+            // IAudioTrack and its native write can block for several seconds.
+            // A deep-buffer track is still explicitly routed to TELEPHONY,
+            // but survives the route transition and releases cleanly between
+            // consecutive calls.
+            playbackLowLatency = false,
+            playbackBufferMs = 100,
+            routeChangeDelayMs = 500,
+            audioRouteSettleDelayMs = 500,
+            audioStopSettleDelayMs = 18_000,
+            appopsPropagationMs = 300,
+        )
+
         /** Generic Qualcomm device — tries incall_music, generic controls */
         fun genericQualcomm() = DeviceProfile(
             name = "Generic Qualcomm",
@@ -452,7 +987,12 @@ data class DeviceProfile(
                 append("tinymix 'Incall_Music Audio Mixer MultiMedia2' 1 2>/dev/null; ")
                 append("tinymix 'Voice Tx Mute' 0 2>/dev/null")
             },
-            mixerDiagGrep = "tinymix 2>&1 | grep -iE '(voice|incall|music|multimedia)'",
+            mixerVerifyCmd = buildString {
+                append("echo -n 'VoiceRxDevMute='; tinymix 'Voice Rx Device Mute' 2>&1; ")
+                append("echo -n 'VoiceTxMute='; tinymix 'Voice Tx Mute' 2>&1; ")
+                append("echo -n 'IncallMM1='; tinymix 'Incall_Music Audio Mixer MultiMedia1' 2>&1; ")
+                append("echo -n 'IncallMM2='; tinymix 'Incall_Music Audio Mixer MultiMedia2' 2>&1")
+            },
             musicVolPercent = 20,
             captureGain = 1,
             playbackGain = 2,
@@ -479,7 +1019,10 @@ data class DeviceProfile(
                 append("tinymix 'Sub Mic Switch' 1 2>/dev/null")
             },
             mixerIncallMusicCmd = "",  // May not have incall_music
-            mixerDiagGrep = "tinymix 2>&1 | grep -iE '(mic|spk|voice|abox)'",
+            mixerVerifyCmd = buildString {
+                append("echo -n 'MainMic='; tinymix 'Main Mic Switch' 2>&1; ")
+                append("echo -n 'SubMic='; tinymix 'Sub Mic Switch' 2>&1")
+            },
             musicVolPercent = 20,
             captureGain = 1,
             playbackGain = 2,
@@ -499,7 +1042,7 @@ data class DeviceProfile(
             mixerSetupCmd = "",
             mixerRestoreCmd = "",
             mixerIncallMusicCmd = "",
-            mixerDiagGrep = "tinymix 2>&1 | head -30",
+            mixerVerifyCmd = "",
             musicVolPercent = 20,
             captureGain = 1,
             playbackGain = 2,

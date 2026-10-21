@@ -1,5 +1,7 @@
 package com.callagent.gateway.sip
 
+import com.callagent.gateway.rtp.SrtpKeys
+
 /**
  * Lightweight SIP message parser and builder.
  * Ported from the Python SIP implementation in sip/sip.py
@@ -10,17 +12,22 @@ class SipMessage private constructor(
     val body: String
 ) {
 
-    val isRequest: Boolean get() = !startLine.startsWith("SIP/")
-    val isResponse: Boolean get() = startLine.startsWith("SIP/")
+    // Be liberal about whitespace.  A few SIP stacks prepend a space to the
+    // status line when formatting a response; that is harmless on the wire
+    // but used to make the message look like an unknown request here.
+    private val normalizedStartLine: String get() = startLine.trimStart('\uFEFF', ' ', '\t')
+    val isRequest: Boolean get() = !normalizedStartLine.startsWith("SIP/", ignoreCase = true)
+    val isResponse: Boolean get() = normalizedStartLine.startsWith("SIP/", ignoreCase = true)
 
     val method: String?
-        get() = if (isRequest) startLine.split(" ").firstOrNull() else null
+        get() = if (isRequest) normalizedStartLine.trim().split(Regex("\\s+"), limit = 2).firstOrNull() else null
 
     val statusCode: Int?
-        get() = if (isResponse) startLine.split(" ").getOrNull(1)?.toIntOrNull() else null
+        get() = if (isResponse) STATUS_CODE.matchEntire(normalizedStartLine.trim())
+            ?.groupValues?.get(1)?.toIntOrNull() else null
 
     val requestUri: String?
-        get() = if (isRequest) startLine.split(" ").getOrNull(1) else null
+        get() = if (isRequest) normalizedStartLine.trim().split(Regex("\\s+"), limit = 3).getOrNull(1) else null
 
     fun header(name: String): String? =
         headers[name.lowercase()]
@@ -48,7 +55,29 @@ class SipMessage private constructor(
         return headerValue.substring(sipIdx + 4, atIdx)
     }
 
-    val callerNumber: String? get() = from?.let { extractUser(it) }
+    /** Extract the number from SIP or tel identities used by caller-ID headers. */
+    private fun extractIdentityUser(headerValue: String): String? {
+        extractUser(headerValue)?.let { return it }
+        val telIdx = headerValue.indexOf("tel:", ignoreCase = true)
+        if (telIdx < 0) return null
+        return headerValue.substring(telIdx + 4)
+            .substringBefore('>')
+            .substringBefore(';')
+            .trim()
+            .ifEmpty { null }
+    }
+
+    /**
+     * Prefer the asserted caller identity when Asterisk sends Outbound CID
+     * in P-Asserted-Identity/Remote-Party-ID; otherwise use From.  Different
+     * PJSIP trunk settings place the same CID in different headers.
+     */
+    val callerNumber: String?
+        get() = sequenceOf(
+            header("p-asserted-identity"),
+            header("remote-party-id"),
+            from
+        ).mapNotNull { it?.let(::extractIdentityUser) }.firstOrNull()
     val dialedNumber: String? get() = to?.let { extractUser(it) }
 
     /** Extract display name from From header, e.g. "Display" <sip:...> */
@@ -114,11 +143,19 @@ class SipMessage private constructor(
             return result
         }
 
+    /** Payload type the peer uses for RFC 4733 telephone-event, if offered.
+     *  The 8 kHz clock is preferred: that is the rate the event durations are
+     *  counted in, and the only one Asterisk sends for narrowband calls. */
+    val sdpTelephoneEventPt: Int?
+        get() {
+            val events = sdpCodecs.filter { it.second.lowercase().startsWith("telephone-event") }
+            return (events.firstOrNull { it.second.lowercase().startsWith("telephone-event/8000") }
+                ?: events.firstOrNull())?.first
+        }
+
     /** Get the preferred payload type from the remote SDP.
      *  Collects all payload types offered in the remote m=audio line,
-     *  then picks OUR preferred codec: PCMA > PCMU > G.722.
-     *  G.711 preferred for compatibility; G.722 used as fallback when
-     *  the remote only offers wideband. */
+     *  then picks OUR preferred codec: G.722 > PCMA > PCMU. */
     val sdpPreferredPayloadType: Int
         get() {
             val mLine = body.lineSequence().firstOrNull {
@@ -130,14 +167,52 @@ class SipMessage private constructor(
             for (i in 3 until parts.size) {
                 parts[i].trim().toIntOrNull()?.let { offered.add(it) }
             }
-            // PCMA preferred for compatibility; G.722 as wideband fallback
-            return when {
+            // Follow the configured preference, but never fail a call over it:
+            // if the remote offers nothing we prefer, take what it does offer
+            // rather than answering with a codec it cannot speak.
+            val g711 = when {
                 8 in offered -> 8   // PCMA (G.711 A-law, 8 kHz)
-                0 in offered -> 0   // PCMU (G.711 μ-law, 8 kHz)
-                9 in offered -> 9   // G.722 (wideband, 16 kHz)
-                else -> 8
+                0 in offered -> 0   // PCMU (G.711 mu-law, 8 kHz)
+                else -> null
+            }
+            return when (SipBuilder.codecMode) {
+                "g711" -> g711 ?: if (9 in offered) 9 else 8
+                else -> if (9 in offered) 9 else (g711 ?: 9)
             }
         }
+
+    /**
+     * True when the peer's media line asks for SRTP (`RTP/SAVP`).
+     *
+     * The profile is what decides whether media is protected -- a crypto line
+     * on an `RTP/AVP` stream is not an SRTP offer, and answering one with
+     * SAVP would send encrypted audio to something expecting plain RTP.
+     */
+    val sdpIsSavp: Boolean
+        get() = body.lineSequence()
+            .firstOrNull { it.startsWith("m=audio") }
+            ?.contains("RTP/SAVP") == true
+
+    /**
+     * The peer's `a=crypto` lines (RFC 4568), in offer order, as
+     * (tag, suite, inline-and-params).  Suites this build cannot do are left
+     * in: the caller picks, and knowing what was offered makes a failure to
+     * agree explainable rather than silent.
+     */
+    val sdpCryptoLines: List<Triple<Int, String, String>>
+        get() = body.lineSequence()
+            .filter { it.startsWith("a=crypto:") }
+            .mapNotNull { line ->
+                // a=crypto:<tag> <suite> inline:<key>[|lifetime][|MKI] [params]
+                val parts = line.removePrefix("a=crypto:").trim().split(Regex("\\s+"), limit = 3)
+                if (parts.size < 3) return@mapNotNull null
+                val tag = parts[0].toIntOrNull() ?: return@mapNotNull null
+                val keyParam = parts[2].split(Regex("\\s+"))
+                    .firstOrNull { it.startsWith("inline:") }
+                    ?.removePrefix("inline:") ?: return@mapNotNull null
+                Triple(tag, parts[1], keyParam)
+            }
+            .toList()
 
     /** Check for custom gateway header: X-GSM-Forward */
     val gsmForwardNumber: String?
@@ -164,25 +239,32 @@ class SipMessage private constructor(
     private var raw: String? = null
 
     companion object {
+        private val HEADER_SEPARATOR = Regex("\\r?\\n\\r?\\n")
+        private val STATUS_CODE = Regex("^SIP/\\S+\\s+(\\d{3})(?:\\s+.*)?$", RegexOption.IGNORE_CASE)
+
         /** Parse a raw SIP message string */
         fun parse(data: String): SipMessage? {
-            val headerBodySplit = data.indexOf("\r\n\r\n")
-            if (headerBodySplit < 0) return null
+            val separator = HEADER_SEPARATOR.find(data) ?: return null
+            val headerSection = data.substring(0, separator.range.first)
+            val body = data.substring(separator.range.last + 1)
+            val lines = headerSection.split(Regex("\\r?\\n"))
+            if (lines.isEmpty() || lines[0].trim().isEmpty()) return null
 
-            val headerSection = data.substring(0, headerBodySplit)
-            val body = data.substring(headerBodySplit + 4)
-            val lines = headerSection.split("\r\n")
-            if (lines.isEmpty()) return null
-
-            val startLine = lines[0]
+            val startLine = lines[0].trimStart('\uFEFF')
             val headers = LinkedHashMap<String, String>()
+            var previousKey: String? = null
             for (i in 1 until lines.size) {
                 val line = lines[i]
+                if (line.startsWith(" ") || line.startsWith("\t")) {
+                    previousKey?.let { headers[it] = "${headers[it]} ${line.trim()}" }
+                    continue
+                }
                 val colonIdx = line.indexOf(':')
                 if (colonIdx > 0) {
                     val key = line.substring(0, colonIdx).trim().lowercase()
                     val value = line.substring(colonIdx + 1).trim()
                     headers[key] = value
+                    previousKey = key
                 }
             }
 
@@ -199,6 +281,38 @@ class SipMessage private constructor(
 
 /** Builder for constructing SIP messages */
 object SipBuilder {
+    /**
+     * How this gateway identifies itself in SIP traffic, the way a Fritz!Box
+     * announces itself as "AVM FRITZ!Box 7530 AX".  Without it the device is
+     * anonymous in the server's logs and CDRs.  SipClient sets it once at
+     * startup so the configured server domain can be included.
+     */
+    @Volatile
+    var userAgent: String = "gsm2sip"
+
+    /** Which codecs to offer and accept: "g722", "g711" or "both".
+     *
+     *  G.722 alone is the default and the reason audio is wideband: when G.711
+     *  is offered alongside it, servers routinely pick PCMA and every call ends
+     *  up narrowband regardless of what both ends support. */
+    @Volatile
+    var codecMode: String = "g722"
+
+    /**
+     * Transport token for Via, and the matching Contact parameter.
+     *
+     * Set once when the transport is created.  Via must name the transport the
+     * request actually travelled over or responses are routed back wrongly,
+     * and Contact must carry `transport=tls` so the server sends inbound
+     * requests down the existing TLS connection instead of trying to open a
+     * fresh UDP path to a port that is not listening.
+     */
+    @Volatile
+    var transport: String = "UDP"
+
+    private val contactParam: String
+        get() = if (transport == "TLS") ";transport=tls" else ""
+
     private fun branch(): String = "z9hG4bK${(100000000..999999999).random()}"
     private fun tag(): String = "gw${(100000000..999999999).random()}"
 
@@ -211,13 +325,14 @@ object SipBuilder {
         val uri = "sip:$domain:$serverPort"
         return buildString {
             append("REGISTER $uri SIP/2.0\r\n")
-            append("Via: SIP/2.0/UDP $localIp:$localPort;branch=${branch()};rport\r\n")
+            append("Via: SIP/2.0/$transport $localIp:$localPort;branch=${branch()};rport\r\n")
             append("Max-Forwards: 70\r\n")
+            append("User-Agent: $userAgent\r\n")
             append("To: <sip:$username@$domain>\r\n")
             append("From: <sip:$username@$localIp>;tag=${tag()}\r\n")
             append("Call-ID: $callId\r\n")
             append("CSeq: $cseq REGISTER\r\n")
-            append("Contact: <sip:$username@$localIp:$localPort>;expires=3600\r\n")
+            append("Contact: <sip:$username@$localIp:$localPort$contactParam>;expires=3600\r\n")
             if (auth != null) append(auth)
             append("Content-Length: 0\r\n\r\n")
         }
@@ -232,20 +347,22 @@ object SipBuilder {
         fromTag: String = tag(),
         callerIdNumber: String? = null,
         callerIdName: String? = null,
-        auth: String? = null
+        auth: String? = null,
+        srtp: SrtpKeys? = null
     ): String {
         val fromDisplay = if (callerIdName != null) "\"$callerIdName\" " else ""
         val fromUser = callerIdNumber ?: username
-        val sdp = buildSdp(localIp, localRtpPort)
+        val sdp = buildSdp(localIp, localRtpPort, srtp)
         return buildString {
             append("INVITE $targetUri SIP/2.0\r\n")
-            append("Via: SIP/2.0/UDP $localIp:$localPort;branch=${branch()};rport\r\n")
+            append("Via: SIP/2.0/$transport $localIp:$localPort;branch=${branch()};rport\r\n")
             append("Max-Forwards: 70\r\n")
+            append("User-Agent: $userAgent\r\n")
             append("To: <$targetUri>\r\n")
             append("From: $fromDisplay<sip:$fromUser@$domain>;tag=$fromTag\r\n")
             append("Call-ID: $callId\r\n")
             append("CSeq: $cseq INVITE\r\n")
-            append("Contact: <sip:$username@$localIp:$localPort>\r\n")
+            append("Contact: <sip:$username@$localIp:$localPort$contactParam>\r\n")
             if (auth != null) append(auth)
             append("Content-Type: application/sdp\r\n")
             append("Content-Length: ${sdp.length}\r\n\r\n")
@@ -253,15 +370,79 @@ object SipBuilder {
         }
     }
 
-    fun ok200(
+    /**
+     * A page-mode SIP MESSAGE (RFC 3428) — one request, one response, no
+     * dialog.  Used to hand a received SMS to the server.
+     *
+     * Content-Length counts *bytes*: SMS text is UTF-8 and a message with any
+     * non-ASCII character in it would otherwise declare a length shorter than
+     * what goes on the wire, and the server would truncate the body.
+     */
+    fun message(
+        targetUri: String,
+        fromUser: String, domain: String,
+        localIp: String, localPort: Int,
+        callId: String, cseq: Int,
+        body: String,
+        contentType: String = "text/plain;charset=UTF-8",
+        extraHeaders: List<String> = emptyList(),
+        fromTag: String = tag(),
+        auth: String? = null
+    ): String = buildString {
+        append("MESSAGE $targetUri SIP/2.0\r\n")
+        append("Via: SIP/2.0/$transport $localIp:$localPort;branch=${branch()};rport\r\n")
+        append("Max-Forwards: 70\r\n")
+        append("User-Agent: $userAgent\r\n")
+        append("To: <$targetUri>\r\n")
+        append("From: <sip:$fromUser@$domain>;tag=$fromTag\r\n")
+        append("Call-ID: $callId\r\n")
+        append("CSeq: $cseq MESSAGE\r\n")
+        for (h in extraHeaders) append("$h\r\n")
+        if (auth != null) append(auth)
+        append("Content-Type: $contentType\r\n")
+        append("Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n\r\n")
+        append(body)
+    }
+
+    /**
+     * A bare status response for a page-mode request.
+     *
+     * 202 for a MESSAGE we have taken responsibility for, 4xx to refuse one.
+     * No Contact: there is no dialog to route anything into.
+     */
+    fun statusResponse(
         msg: SipMessage,
-        username: String, localIp: String, localPort: Int,
-        localRtpPort: Int? = null,
+        code: Int,
+        reason: String,
+        extraHeaders: List<String> = emptyList(),
         toTag: String = tag()
     ): String {
         val to = msg.to ?: ""
         val toWithTag = if (to.contains(";tag=")) to else "$to;tag=$toTag"
-        val sdp = if (localRtpPort != null) buildSdp(localIp, localRtpPort) else null
+        return buildString {
+            append("SIP/2.0 $code $reason\r\n")
+            append("Via: ${msg.via}\r\n")
+            append("To: $toWithTag\r\n")
+            append("From: ${msg.from}\r\n")
+            append("Call-ID: ${msg.callId}\r\n")
+            append("CSeq: ${msg.cseq}\r\n")
+            append("User-Agent: $userAgent\r\n")
+            for (h in extraHeaders) append("$h\r\n")
+            append("Content-Length: 0\r\n\r\n")
+        }
+    }
+
+    fun ok200(
+        msg: SipMessage,
+        username: String, localIp: String, localPort: Int,
+        localRtpPort: Int? = null,
+        toTag: String = tag(),
+        srtp: SrtpKeys? = null,
+        srtpTag: Int = 1
+    ): String {
+        val to = msg.to ?: ""
+        val toWithTag = if (to.contains(";tag=")) to else "$to;tag=$toTag"
+        val sdp = if (localRtpPort != null) buildSdp(localIp, localRtpPort, srtp, srtpTag) else null
         return buildString {
             append("SIP/2.0 200 OK\r\n")
             append("Via: ${msg.via}\r\n")
@@ -269,7 +450,7 @@ object SipBuilder {
             append("From: ${msg.from}\r\n")
             append("Call-ID: ${msg.callId}\r\n")
             append("CSeq: ${msg.cseq}\r\n")
-            append("Contact: <sip:$username@$localIp:$localPort>\r\n")
+            append("Contact: <sip:$username@$localIp:$localPort$contactParam>\r\n")
             if (sdp != null) {
                 append("Content-Type: application/sdp\r\n")
                 append("Content-Length: ${sdp.length}\r\n\r\n")
@@ -287,6 +468,7 @@ object SipBuilder {
         append("From: ${msg.from}\r\n")
         append("Call-ID: ${msg.callId}\r\n")
         append("CSeq: ${msg.cseq}\r\n")
+        append("Server: $userAgent\r\n")
         append("Content-Length: 0\r\n\r\n")
     }
 
@@ -300,6 +482,27 @@ object SipBuilder {
             append("From: ${msg.from}\r\n")
             append("Call-ID: ${msg.callId}\r\n")
             append("CSeq: ${msg.cseq}\r\n")
+            append("Server: $userAgent\r\n")
+            append("Content-Length: 0\r\n\r\n")
+        }
+    }
+
+    /**
+     * Turn an INVITE down.  Same shape as 180, with the code and reason the
+     * caller chose, so the server is told why rather than being answered and
+     * bridged to nothing.
+     */
+    fun reject(msg: SipMessage, code: Int, reason: String, toTag: String = tag()): String {
+        val to = msg.to ?: ""
+        val toWithTag = if (to.contains(";tag=")) to else "$to;tag=$toTag"
+        return buildString {
+            append("SIP/2.0 $code $reason\r\n")
+            append("Via: ${msg.via}\r\n")
+            append("To: $toWithTag\r\n")
+            append("From: ${msg.from}\r\n")
+            append("Call-ID: ${msg.callId}\r\n")
+            append("CSeq: ${msg.cseq}\r\n")
+            append("Server: $userAgent\r\n")
             append("Content-Length: 0\r\n\r\n")
         }
     }
@@ -311,13 +514,14 @@ object SipBuilder {
         username: String, localIp: String, localPort: Int
     ): String = buildString {
         append("ACK $targetUri SIP/2.0\r\n")
-        append("Via: SIP/2.0/UDP $localIp:$localPort;branch=${branch()};rport\r\n")
+        append("Via: SIP/2.0/$transport $localIp:$localPort;branch=${branch()};rport\r\n")
         append("Max-Forwards: 70\r\n")
+            append("User-Agent: $userAgent\r\n")
         append("To: $toHeader\r\n")
         append("From: $fromHeader\r\n")
         append("Call-ID: $callId\r\n")
         append("CSeq: $cseq ACK\r\n")
-        append("Contact: <sip:$username@$localIp:$localPort>\r\n")
+        append("Contact: <sip:$username@$localIp:$localPort$contactParam>\r\n")
         append("Content-Length: 0\r\n\r\n")
     }
 
@@ -328,13 +532,14 @@ object SipBuilder {
         username: String, localIp: String, localPort: Int
     ): String = buildString {
         append("BYE $targetUri SIP/2.0\r\n")
-        append("Via: SIP/2.0/UDP $localIp:$localPort;branch=${branch()};rport\r\n")
+        append("Via: SIP/2.0/$transport $localIp:$localPort;branch=${branch()};rport\r\n")
         append("Max-Forwards: 70\r\n")
+            append("User-Agent: $userAgent\r\n")
         append("From: $fromHeader\r\n")
         append("To: $toHeader\r\n")
         append("Call-ID: $callId\r\n")
         append("CSeq: $cseq BYE\r\n")
-        append("Contact: <sip:$username@$localIp:$localPort>\r\n")
+        append("Contact: <sip:$username@$localIp:$localPort$contactParam>\r\n")
         append("Content-Length: 0\r\n\r\n")
     }
 
@@ -347,6 +552,7 @@ object SipBuilder {
         append("CANCEL $targetUri SIP/2.0\r\n")
         append("Via: $viaHeader\r\n")
         append("Max-Forwards: 70\r\n")
+            append("User-Agent: $userAgent\r\n")
         append("From: $fromHeader\r\n")
         append("To: $toHeader\r\n")
         append("Call-ID: $callId\r\n")
@@ -354,30 +560,109 @@ object SipBuilder {
         append("Content-Length: 0\r\n\r\n")
     }
 
-    fun optionsResponse(msg: SipMessage, username: String, localIp: String, localPort: Int): String =
-        buildString {
+    /**
+     * 200 to an OPTIONS: both a liveness answer and a capability dump.
+     *
+     * The server qualifies every registered peer with OPTIONS and stores what
+     * comes back, so this is the only place it learns what this gateway can
+     * do.  Answering with a bare Allow line left it with nothing to store.
+     *
+     * Everything advertised here is something this build actually implements.
+     * There is no Supported: header because this stack supports none of the
+     * extensions worth naming -- no 100rel, no replaces, no UPDATE -- and
+     * claiming them invites requests it would have to reject mid-call, which
+     * is worse than admitting the gap.  The Allow list is likewise the real
+     * set of handled methods, not the conventional long one.
+     */
+    fun optionsResponse(msg: SipMessage, username: String, localIp: String, localPort: Int): String {
+        // A capability description, not an offer: no port is reserved and no
+        // crypto line appears.  SRTP keys are per-call and generated when the
+        // call is set up -- putting one here would publish a key outside any
+        // dialog that used it.  This is also what a FRITZ!Box reports, which
+        // likewise answers OPTIONS with plain AVP while doing SDES on calls.
+        val payloads = when (codecMode) {
+            "g711" -> "8 0 101"
+            "both" -> "9 8 0 101"
+            else -> "9 101"
+        }
+        val sdp = buildString {
+            append("v=0\r\n")
+            append("o=gateway 0 0 IN IP4 $localIp\r\n")
+            append("s=SIP Gateway capabilities\r\n")
+            append("c=IN IP4 $localIp\r\n")
+            append("t=0 0\r\n")
+            append("m=audio 0 RTP/AVP $payloads\r\n")
+            if (codecMode != "g711") append("a=rtpmap:9 G722/8000\r\n")
+            if (codecMode != "g722") {
+                append("a=rtpmap:8 PCMA/8000\r\n")
+                append("a=rtpmap:0 PCMU/8000\r\n")
+            }
+            append("a=rtpmap:101 telephone-event/8000\r\n")
+            append("a=fmtp:101 0-16\r\n")
+            append("a=ptime:20\r\n")
+            append("a=sendrecv\r\n")
+        }
+        return buildString {
             append("SIP/2.0 200 OK\r\n")
             append("Via: ${msg.via}\r\n")
             append("To: ${msg.to}\r\n")
             append("From: ${msg.from}\r\n")
             append("Call-ID: ${msg.callId}\r\n")
             append("CSeq: ${msg.cseq}\r\n")
-            append("Contact: <sip:$username@$localIp:$localPort>\r\n")
-            append("Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\n")
-            append("Content-Length: 0\r\n\r\n")
+            append("Contact: <sip:$username@$localIp:$localPort$contactParam>\r\n")
+            append("User-Agent: $userAgent\r\n")
+            // The real set: CANCEL and MESSAGE included because inbound ones
+            // are handled; nothing here is aspirational.
+            append("Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, MESSAGE\r\n")
+            // text/plain because inbound MESSAGE carries SMS bodies.
+            append("Accept: application/sdp, text/plain\r\n")
+            append("Accept-Encoding: identity\r\n")
+            append("Content-Type: application/sdp\r\n")
+            append("Content-Length: ${sdp.toByteArray(Charsets.UTF_8).size}\r\n\r\n")
+            append(sdp)
         }
+    }
 
-    private fun buildSdp(localIp: String, rtpPort: Int): String = buildString {
-        // Offer PCMA preferred, G.722 as wideband fallback.
-        // G.722 clock rate in SDP is 8000 per RFC 3551 (historical quirk).
+    /**
+     * @param srtp keying material for this call, or null for plain RTP.  It is
+     *   a parameter rather than shared state because every call needs its own
+     *   key: one master key reused across calls would let anyone who recorded
+     *   an earlier one decrypt every later one.
+     * @param srtpTag the crypto tag to answer with.  Answering an offer must
+     *   echo the tag that was accepted (RFC 4568 §5.1.2); 1 is right for an
+     *   offer we originate.
+     */
+    private fun buildSdp(
+        localIp: String,
+        rtpPort: Int,
+        srtp: SrtpKeys? = null,
+        srtpTag: Int = 1
+    ): String = buildString {
+        // G.722 is wideband (16 kHz sampling) but its SDP clock rate is
+        // written as 8000 per RFC 3551 — a historical quirk, not a typo.
+        // telephone-event is always offered: it carries DTMF, not voice.
+        val payloads = when (codecMode) {
+            "g711" -> "8 0 101"
+            "both" -> "9 8 0 101"
+            else -> "9 101"
+        }
         append("v=0\r\n")
         append("o=gateway 0 0 IN IP4 $localIp\r\n")
         append("s=SIP Call\r\n")
         append("c=IN IP4 $localIp\r\n")
         append("t=0 0\r\n")
-        append("m=audio $rtpPort RTP/AVP 8 9 101\r\n")
-        append("a=rtpmap:8 PCMA/8000\r\n")
-        append("a=rtpmap:9 G722/8000\r\n")
+        // SAVP is the SRTP profile.  The transport name and the crypto line
+        // have to agree: one without the other is a malformed offer that a
+        // peer may accept and then fail to decrypt.
+        append("m=audio $rtpPort ${if (srtp != null) "RTP/SAVP" else "RTP/AVP"} $payloads\r\n")
+        if (srtp != null) {
+            append("a=crypto:$srtpTag ${srtp.suite.sdpName} inline:${srtp.toInline()}\r\n")
+        }
+        if (codecMode != "g711") append("a=rtpmap:9 G722/8000\r\n")
+        if (codecMode != "g722") {
+            append("a=rtpmap:8 PCMA/8000\r\n")
+            append("a=rtpmap:0 PCMU/8000\r\n")
+        }
         append("a=rtpmap:101 telephone-event/8000\r\n")
         append("a=fmtp:101 0-16\r\n")
         append("a=ptime:20\r\n")
